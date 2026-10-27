@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Insertion tracking explorer</title>
+  <script type="importmap">
+    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.184.0/examples/jsm/"}}
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.45 system-ui, sans-serif; color: #22313d; background: #f5f7fa; }
+    main { display: grid; grid-template-columns: 390px 1fr; height: 100vh; }
+    aside { padding: 18px; overflow: auto; border-right: 1px solid #ccd5df; }
+    h1 { font-size: 21px; margin: 0 0 8px; }
+    h2 { font-size: 15px; margin: 18px 0 8px; }
+    p { margin: 8px 0; }
+    label { display: block; margin: 10px 0; }
+    select, input[type=file], button { max-width: 100%; padding: 6px; }
+    select { width: 100%; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.4 monospace; background: #e9eef4; padding: 10px; }
+    #view { position: relative; min-width: 0; min-height: 360px; }
+    canvas { display: block; }
+    #legend { position: absolute; left: 16px; bottom: 16px; background: #ffffffed; padding: 10px; pointer-events: none; }
+    #error, #warnings { color: #8b3511; white-space: pre-wrap; }
+    #status { font-weight: 600; }
+    .muted { color: #596977; font-size: 12px; }
+    .notice { border-left: 3px solid #ca8b26; padding-left: 10px; font-size: 12px; }
+    @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } aside { max-height: 55vh; } #view { height: 60vh; } }
+  </style>
+</head>
+<body>
+<main>
+  <aside>
+    <h1>Insertion tracking explorer</h1>
+    <p class="muted">Notebook transform audit only. No acquisition metadata is generated.</p>
+    <label>Load converted CSV <input id="file" type="file" accept=".csv"></label>
+    <p id="status" role="status">Loading ../data/insertion_transforms.csv...</p>
+    <p id="error" role="alert"></p>
+    <label>Insertion <select id="insertion" disabled><option>Load a converted CSV first</option></select></label>
+    <label>Transform step <select id="step" disabled></select></label>
+    <label><input id="target-visible" type="checkbox" checked> Show targeted CCF area</label>
+    <label><input id="brain-visible" type="checkbox" checked> Show brain outline</label>
+    <label><input id="all-visible" type="checkbox"> Show other insertion trajectories</label>
+    <button id="reset" type="button">Reset camera</button>
+    <p id="mesh-status" role="status" class="muted"></p>
+    <h2>Insertion details</h2>
+    <div id="details"></div>
+    <p id="warnings"></p>
+    <pre id="pose"></pre>
+    <p class="notice">Uses the notebook's six transforms with manipulator +X/+Y/+Z
+      mapped to probe +X/+Z/-Y. The move-to-surface translation uses Surface Z relative to Bregma Z,
+      then recording depth advances along local probe -Y.
+      Spin therefore rotates the offset as well as the probe. The two local translations also cancel depth
+      in the final tip position if the manipulator offset is held fixed.
+      The default head-angle correction is +14 degrees, added to Arc AP.</p>
+    <p class="muted">Brain/region placement uses the coordinate builder's approximate CCF-to-bregma mapping,
+      not individual-animal registration. Target meshes show intended areas, not verified hits.
+      A trajectory is shown only for a confirmed insertion with complete numeric data.</p>
+    <details><summary>Schema coordinate systems and transforms</summary><pre id="transforms"></pre></details>
+    <details><summary>Original tracking values</summary><pre id="source"></pre></details>
+    <h2>Usage</h2>
+    <p class="muted">Run <code>python code/insertion_tracking.py</code>, then
+      <code>python -m http.server 8000 --bind 127.0.0.1</code> from the repository root.
+      Open <code>http://localhost:8000/code/insertion_viewer.html</code>.
+      Or open this page directly and choose the converted CSV above.
+      Network access is required for Three.js and atlas meshes; CSV data stays in your browser.</p>
+  </aside>
+  <section id="view" aria-label="3D insertion view">
+    <div id="legend">Drag: orbit | Shift/right-drag: pan | Scroll: zoom<br>
+      Red: +R | Green: +A | Blue: +S | Origin: bregma<br>
+      Orange: selected probe | Pink: surface-to-tip | Purple: target area<br>
+      Probe axes: red X, green +Y (tip to base; insertion is -Y), blue Z
+    </div>
+  </section>
+</main>
+<script>
+'use strict';
+
+// RFC 4180 fields, including embedded commas, quotes and newlines.
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', quoted = false, closed = false;
+  text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (ch === '"') { quoted = false; closed = true; }
+      else field += ch;
+    } else if (ch === '"' && field === '' && !closed) quoted = true;
+    else if (ch === ',' || ch === '\n' || ch === '\r') {
+      row.push(field); field = ''; closed = false;
+      if (ch !== ',') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        if (row.some(value => value !== '')) rows.push(row);
+        row = [];
+      }
+    } else {
+      if (closed || ch === '"') throw new Error('Malformed CSV quoting.');
+      field += ch;
+    }
+  }
+  if (quoted) throw new Error('Unterminated quoted CSV field.');
+  if (field || row.length || closed) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function decodeInsertions(text) {
+  const [headers, ...values] = parseCSV(text);
+  const required = ['setup_no', 'status', 'target_id', 'transforms', 'steps', 'source',
+    'global_coordinate_system', 'probe_coordinate_system'];
+  if (!headers || required.some(key => !headers.includes(key))) {
+    throw new Error('Choose insertion_transforms.csv produced by insertion_tracking.py, not the raw tracking CSV.');
+  }
+  if (!values.length) throw new Error('The converted CSV contains no insertions.');
+  const seen = new Set();
+  return values.map((cells, index) => {
+    if (cells.length !== headers.length) throw new Error(`CSV row ${index + 2}: incorrect column count.`);
+    const row = Object.fromEntries(headers.map((key, i) => [key, cells[i]]));
+    if (!row.setup_no || seen.has(row.setup_no)) throw new Error('Missing or duplicate setup number.');
+    seen.add(row.setup_no);
+    for (const key of ['transforms', 'steps', 'source', 'global_coordinate_system', 'probe_coordinate_system']) {
+      row[key] = JSON.parse(row[key]);
+    }
+    if (!['ok', 'invalid', 'not_inserted'].includes(row.status)) throw new Error('Unknown insertion status.');
+    if (!Array.isArray(row.steps) || !Array.isArray(row.transforms)) throw new Error('Invalid transform/step lists.');
+    const vector = value => Array.isArray(value) && value.length === 3 && value.every(Number.isFinite);
+    if (row.status === 'ok' && (row.steps.length !== 7 || row.transforms.length !== 6 ||
+        row.steps.some(step => !vector(step.position) || !Array.isArray(step.basis) ||
+          step.basis.length !== 3 || !step.basis.every(vector)))) {
+      throw new Error(`Setup ${row.setup_no}: invalid pose data.`);
+    }
+    if (row.target_id && !/^\d+$/.test(row.target_id)) throw new Error('Invalid CCF target identifier.');
+    return row;
+  });
+}
+
+function rasToScene(ras) {
+  return [ras[0], ras[2], -ras[1]];
+}
+
+const controls = Object.fromEntries(
+  ['file', 'status', 'error', 'insertion', 'step', 'target-visible', 'brain-visible', 'all-visible',
+    'reset', 'mesh-status', 'details', 'warnings', 'pose', 'transforms', 'source', 'view']
+    .map(id => [id, document.getElementById(id)]));
+let insertions = [], graphics = null;
+
+function selectInsertion() {
+  const row = insertions[Number(controls.insertion.value)];
+  if (!row) return;
+  controls.step.replaceChildren(...row.steps.map((step, index) => new Option(step.label, String(index))));
+  controls.step.disabled = row.status !== 'ok';
+  controls.step.value = row.status === 'ok' ? '6' : '';
+  controls.details.textContent = `Setup ${row.setup_no} | Mouse ${row.mouse} | ${row.date}\n` +
+    `Target: ${row.target} (${row.target_name || 'unresolved'}) | ${row.status}\n` +
+    `Inserted: ${row.inserted || '?'} | Recorded: ${row.recorded || '?'} | On target: ${row.on_target || '?'}\n` +
+    `Head correction: ${row.head_angle_deg} degrees (added to Arc AP) | Depth: ${row.depth_mm || 'unavailable'} mm`;
+  controls.details.style.whiteSpace = 'pre-line';
+  controls.warnings.textContent = [row.error, row.warnings].filter(Boolean).join('\n');
+  controls.transforms.textContent = JSON.stringify({
+    global_coordinate_system: row.global_coordinate_system,
+    probe_coordinate_system: row.probe_coordinate_system, transform: row.transforms,
+  }, null, 2);
+  controls.source.textContent = JSON.stringify(row.source, null, 2);
+  renderSelection();
+}
+
+function renderSelection() {
+  const row = insertions[Number(controls.insertion.value)];
+  const step = row?.steps[Number(controls.step.value)];
+  controls.pose.textContent = step ? `${step.label}\nTip RAS (mm): ${step.position.map(v => v.toFixed(4)).join(', ')}\n` +
+    `Probe +Y: ${step.basis[1].map(v => v.toFixed(4)).join(', ')}` : 'No trajectory: see row status above.';
+  if (graphics && row) graphics.render(row, step);
+}
+
+function loadCSV(text, name) {
+  const parsed = decodeInsertions(text);
+  insertions = parsed;
+  controls.insertion.replaceChildren(...insertions.map((row, index) =>
+    new Option(`#${row.setup_no} | ${row.mouse} | ${row.target || 'no target'} | ${row.date} | ${row.status}`, String(index))));
+  controls.insertion.disabled = false;
+  controls.insertion.value = String(Math.max(0, insertions.findIndex(row => row.status === 'ok')));
+  controls.status.textContent = `${name}: ${insertions.length} setups, ` +
+    `${insertions.filter(row => row.status === 'ok').length} viewable`;
+  controls.error.textContent = '';
+  selectInsertion();
+}
+controls.file.addEventListener('change', async () => {
+  const file = controls.file.files[0];
+  if (!file) return;
+  try { loadCSV(await file.text(), file.name); }
+  catch (error) { controls.error.textContent = error.message; }
+});
+controls.insertion.addEventListener('change', selectInsertion);
+controls.step.addEventListener('change', renderSelection);
+for (const id of ['target-visible', 'brain-visible', 'all-visible']) {
+  controls[id].addEventListener('change', renderSelection);
+}
+controls.reset.addEventListener('click', () => graphics?.reset());
+if (location.protocol !== 'file:') {
+  fetch('../data/insertion_transforms.csv').then(response => {
+    if (!response.ok) throw new Error(`CSV request failed (${response.status}). Run insertion_tracking.py first.`);
+    return response.text();
+  }).then(text => loadCSV(text, '../data/insertion_transforms.csv')).catch(error => {
+    controls.status.textContent = 'No CSV loaded';
+    controls.error.textContent = error.message;
+  });
+} else controls.status.textContent = 'Choose insertion_transforms.csv above.';
+
+async function initializeGraphics() {
+  const THREE = await import('three');
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  const { OBJLoader } = await import('three/addons/loaders/OBJLoader.js');
+  const wrap = controls.view, scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xf8fafc);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 200);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  wrap.prepend(renderer.domElement);
+  const orbit = new OrbitControls(camera, renderer.domElement);
+  function reset() {
+    camera.position.set(14, 12, 16);
+    orbit.target.set(0, -3.668, 1.2);
+    orbit.update();
+  }
+  reset();
+  scene.add(new THREE.AmbientLight(0xffffff, 1.6));
+  const light = new THREE.DirectionalLight(0xffffff, 2);
+  light.position.set(10, 20, 10); scene.add(light);
+  // Keep this mapping right-handed: Three.js X=R, Y=S, Z=P.
+  // Use the builder's approximate CCF bregma offsets in this scene basis.
+  const toThree = ras => new THREE.Vector3(...rasToScene(ras));
+  const ccfMatrix = new THREE.Matrix4().set(
+    0, 0, .001, -5.7, 0, -.001, 0, .332, .001, 0, 0, -5.4, 0, 0, 0, 1);
+  const origin = new THREE.Vector3();
+  [[1, 0, 0], [0, 1, 0], [0, 0, 1]].forEach((axis, i) => scene.add(
+    new THREE.ArrowHelper(toThree(axis), origin, 5, [0xe64b35, 0x329b49, 0x387fe5][i], .3, .15)));
+  const bregma = new THREE.Mesh(new THREE.SphereGeometry(.12), new THREE.MeshBasicMaterial({ color: 0x263747 }));
+  scene.add(bregma);
+  const selected = new THREE.Group(), others = new THREE.Group();
+  scene.add(selected, others);
+  const loader = new OBJLoader(), meshes = new Map(), failures = new Map();
+  const meshBase = 'https://allen-data-views.s3.amazonaws.com/data-asset-cache/meshes/';
+  let activeTarget = '';
+  function updateMeshStatus() {
+    controls['mesh-status'].textContent = [['997', 'Brain'], ...(activeTarget && activeTarget !== '997' ?
+      [[activeTarget, 'Target']] : [])].map(([id, name]) => {
+      if (failures.has(id)) return `${name} mesh unavailable: ${failures.get(id)}.`;
+      return `${name} mesh ${meshes.has(id) ? 'loaded' : 'loading...'}`;
+    }).join(' ');
+  }
+  function meshVisibility() {
+    for (const [id, mesh] of meshes) {
+      mesh.visible = (id === '997' && controls['brain-visible'].checked) ||
+        (id === activeTarget && controls['target-visible'].checked);
+    }
+  }
+  const pending = new Set();
+  function ensureMesh(id) {
+    if (meshes.has(id) || pending.has(id) || failures.has(id)) return;
+    pending.add(id);
+    loader.load(`${meshBase}${id}.obj`, object => {
+      object.traverse(child => {
+        if (!child.isMesh) return;
+        child.geometry.applyMatrix4(ccfMatrix);
+        child.material = new THREE.MeshPhongMaterial({
+          color: id === '997' ? 0x737373 : 0x9b4dcc,
+          transparent: true, opacity: id === '997' ? .09 : .38,
+          side: THREE.DoubleSide, depthWrite: false,
+        });
+      });
+      pending.delete(id); meshes.set(id, object); scene.add(object);
+      meshVisibility(); updateMeshStatus();
+    }, undefined, () => {
+      pending.delete(id); failures.set(id, 'network or atlas asset error');
+      updateMeshStatus();
+    });
+  }
+  function clear(group) {
+    for (const child of [...group.children]) {
+      child.traverse(object => {
+        object.geometry?.dispose();
+        if (Array.isArray(object.material)) object.material.forEach(material => material.dispose());
+        else object.material?.dispose();
+      });
+      group.remove(child);
+    }
+  }
+  function line(group, start, end, color, opacity = 1) {
+    const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+    group.add(new THREE.Line(geometry, new THREE.LineBasicMaterial({ color, transparent: true, opacity })));
+  }
+  function probe(group, step, color, opacity = 1) {
+    const tip = toThree(step.position), direction = toThree(step.basis[1]);
+    line(group, tip, tip.clone().addScaledVector(direction, 10), color, opacity);
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(.09, 12, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity }));
+    marker.position.copy(tip); group.add(marker);
+  }
+  function render(row, step) {
+    clear(selected); clear(others);
+    activeTarget = row.target_id;
+    if (activeTarget) ensureMesh(activeTarget);
+    meshVisibility(); updateMeshStatus();
+    if (step) {
+      probe(selected, step, 0xe88514);
+      const point = toThree(step.position);
+      step.basis.forEach((axis, i) => selected.add(
+        new THREE.ArrowHelper(toThree(axis).normalize(), point, 1.2, [0xe64b35, 0x329b49, 0x387fe5][i], .18, .09)));
+      // Surface-to-tip is visible at both surface and final recording steps.
+      if (Number(controls.step.value) >= 5) {
+        line(selected, toThree(row.steps[5].position), toThree(row.steps[6].position), 0xd52f85);
+      }
+      line(selected, origin, point, 0xe88514, .25);
+    }
+    if (controls['all-visible'].checked) {
+      for (const other of insertions) {
+        if (other !== row && other.status === 'ok') probe(others, other.steps[6], 0x637787, .2);
+      }
+    }
+  }
+  new ResizeObserver(() => {
+    const width = wrap.clientWidth, height = wrap.clientHeight;
+    renderer.setSize(width, height);
+    camera.aspect = width / height; camera.updateProjectionMatrix();
+  }).observe(wrap);
+  renderer.setAnimationLoop(() => { orbit.update(); renderer.render(scene, camera); });
+  ensureMesh('997');
+  graphics = { render, reset };
+  renderSelection();
+}
+initializeGraphics().catch(error => {
+  controls['mesh-status'].textContent = `3D viewer unavailable: ${error.message}. Check WebGL and network access.`;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+[project]
+name = "aind-vr-foraging-ephys-metadata"
+version = "0.1.0"
+description = "Metadata generation and insertion-transform tools for VR Foraging + OpenEphys experiments"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "aind-data-schema>=2.9.1",
+    "aind-data-schema-models>=6.2.1",
+    "numpy",
+    "pandas",
+    "openpyxl>=3.1.5",
+    "requests",
+    "aind-data-transfer-service",
+    "ipykernel",
+    "biodata-schema",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10"]
+
+[tool.uv.sources]
+biodata-schema = { path = "wheels/biodata_schema-4.0.0-py3-none-any.whl" }
+
+[tool.pytest.ini_options]
+pythonpath = [".", "code"]
+testpaths = ["tests"]
+
+[tool.uv]
+default-groups = ["dev"]
