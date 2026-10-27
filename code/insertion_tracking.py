@@ -45,16 +45,16 @@ ROOT = Path(__file__).resolve().parents[1]
 FIELDS = [
     "setup_no", "mouse", "date", "target", "target_name", "target_id",
     "inserted", "recorded", "on_target", "status", "error", "warnings",
-    "head_angle_deg", "depth_mm", "depth_difference_mm", "manipulator_offset_mm",
+    "head_angle_deg", "arc_ap_convention", "depth_mm", "depth_difference_mm", "manipulator_offset_mm",
     "global_coordinate_system", "probe_coordinate_system", "transforms", "steps", "source",
 ]
 STEP_LABELS = [
     "At rest",
     "1. Default probe orientation (global XYZ)",
-    "2. Arc AP + head angle (global X)",
+    "2. Arc AP head-angle correction (global X)",
     "3. Arc ML (local X)",
-    "4. Spin (local Y)",
-    "5. Move to surface (local XYZ, using Surface Z)",
+    "4. Move to surface (local XYZ, using Surface Z)",
+    "5. Spin (local Y)",
     "6. Recording depth (local -Y)",
 ]
 Vector = list[float]
@@ -97,7 +97,7 @@ def number(row: dict[str, str], key: str) -> float:
 
 
 def notebook_transforms(
-    row: dict[str, str], head_angle: float,
+    row: dict[str, str], head_angle: float, anterior_positive: bool = False,
 ) -> tuple[list[Transform], float, Vector]:
     """Notebook cell 3 transforms, with manipulator +X/+Y/+Z mapped to probe +X/+Z/-Y."""
     offset = [
@@ -107,13 +107,15 @@ def notebook_transforms(
         ]
     ]
     depth = (number(row, "Final Z") - number(row, "Surface Z")) / 1000
+    arc_ap = number(row, "Arc AP")
+    probe_tilt = -(arc_ap - head_angle) if anterior_positive else arc_ap + head_angle
     local = ReferenceCoordinateSystem.LOCAL
     transforms: list[Transform] = [
         Rotation(angles=[90, 0, -90]),
-        Rotation(angles=[number(row, "Arc AP") + head_angle, 0, 0]),
+        Rotation(angles=[probe_tilt, 0, 0]),
         Rotation(angles=[-number(row, "Arc ML"), 0, 0], reference_coordinate_system=local),
-        Rotation(angles=[0, number(row, "Spin"), 0], reference_coordinate_system=local),
         Translation(translation=[offset[1], -offset[2], -offset[0]], reference_coordinate_system=local),
+        Rotation(angles=[0, number(row, "Spin"), 0], reference_coordinate_system=local),
         Translation(translation=[0, -depth, 0], reference_coordinate_system=local),
     ]
     return transforms, depth, offset
@@ -170,7 +172,7 @@ def target_details(target: str) -> tuple[str, str, str]:
     return region.name, region.id, ""
 
 
-def convert_row(row: dict[str, str], head_angle: float) -> dict:
+def convert_row(row: dict[str, str], head_angle: float, anterior_positive: bool = False) -> dict:
     """Keep unusable and not-inserted rows visible, with no fabricated transforms."""
     global_cs, probe_cs = coordinate_systems()
     target_name, target_id, target_warning = target_details(row.get("Target", "").strip())
@@ -181,7 +183,9 @@ def convert_row(row: dict[str, str], head_angle: float) -> dict:
         "target_name": target_name, "target_id": target_id,
         "inserted": row.get("Inserted?", ""), "recorded": row.get("Recorded?", ""),
         "on_target": row.get("On target?", ""), "status": "", "error": "", "warnings": "",
-        "head_angle_deg": head_angle, "depth_mm": "", "depth_difference_mm": "",
+        "head_angle_deg": head_angle,
+        "arc_ap_convention": "anterior_positive" if anterior_positive else "posterior_positive",
+        "depth_mm": "", "depth_difference_mm": "",
         "manipulator_offset_mm": [], "global_coordinate_system": global_cs.model_dump(mode="json"),
         "probe_coordinate_system": probe_cs.model_dump(mode="json"), "transforms": [], "steps": [],
         "source": row,
@@ -191,7 +195,7 @@ def convert_row(row: dict[str, str], head_angle: float) -> dict:
         result["warnings"] = "; ".join(warnings + ["Not confirmed inserted; no trajectory generated."])
         return result
     try:
-        transforms, depth, offset = notebook_transforms(row, head_angle)
+        transforms, depth, offset = notebook_transforms(row, head_angle, anterior_positive)
     except ValueError as exc:
         result["status"], result["error"] = "invalid", str(exc)
     else:
@@ -269,13 +273,15 @@ def read_tracking(path: Path) -> list[dict[str, str]]:
     return rows
 
 
-def convert_file(source: Path, destination: Path, head_angle: float = 14.0) -> list[dict]:
+def convert_file(
+    source: Path, destination: Path, head_angle: float = 14.0, anterior_positive: bool = False,
+) -> list[dict]:
     """Write one CSV row per setup, with schema-validated JSON in complex columns."""
     if not math.isfinite(head_angle):
         raise ValueError("Head angle must be finite.")
     if source.resolve() == destination.resolve():
         raise ValueError("Output must not overwrite the insertion tracking input.")
-    rows = [convert_row(row, head_angle) for row in read_tracking(source)]
+    rows = [convert_row(row, head_angle, anterior_positive) for row in read_tracking(source)]
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS)
@@ -295,11 +301,15 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "data" / "insertion_transforms.csv")
     parser.add_argument(
         "--head-angle", type=float, default=14.0,
-        help="Head-angle correction in degrees, added to Arc AP (default: 14).",
+        help="Head-angle correction in degrees (default: 14).",
+    )
+    parser.add_argument(
+        "--anterior-positive", action="store_true",
+        help="Interpret Arc AP as positive anterior and use -(Arc AP - head angle).",
     )
     args = parser.parse_args()
     try:
-        rows = convert_file(args.input, args.output, args.head_angle)
+        rows = convert_file(args.input, args.output, args.head_angle, args.anterior_positive)
     except (OSError, ValueError, csv.Error) as exc:
         parser.exit(1, f"Conversion failed: {exc}\n")
     print(f"Wrote {len(rows)} setups to {args.output}: {dict(Counter(row['status'] for row in rows))}")

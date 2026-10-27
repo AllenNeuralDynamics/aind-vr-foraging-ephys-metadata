@@ -53,7 +53,8 @@
       then recording depth advances along local probe -Y.
       Spin therefore rotates the offset as well as the probe. The two local translations also cancel depth
       in the final tip position if the manipulator offset is held fixed.
-      The default head-angle correction is +14 degrees, added to Arc AP.</p>
+      Posterior-positive Arc AP uses Arc AP + head angle; anterior-positive uses -(Arc AP - head angle).
+      The default head-angle correction is +14 degrees.</p>
     <p class="muted">Brain/region placement uses the coordinate builder's approximate CCF-to-bregma mapping,
       not individual-animal registration. Target meshes show intended areas, not verified hits.
       A trajectory is shown only for a confirmed insertion with complete numeric data.</p>
@@ -149,13 +150,17 @@ let insertions = [], graphics = null;
 function selectInsertion() {
   const row = insertions[Number(controls.insertion.value)];
   if (!row) return;
+  const convention = row.arc_ap_convention || 'posterior_positive';
+  const tiltRule = convention === 'anterior_positive'
+    ? `-(Arc AP - ${row.head_angle_deg})`
+    : `Arc AP + ${row.head_angle_deg}`;
   controls.step.replaceChildren(...row.steps.map((step, index) => new Option(step.label, String(index))));
   controls.step.disabled = row.status !== 'ok';
   controls.step.value = row.status === 'ok' ? '6' : '';
   controls.details.textContent = `Setup ${row.setup_no} | Mouse ${row.mouse} | ${row.date}\n` +
     `Target: ${row.target} (${row.target_name || 'unresolved'}) | ${row.status}\n` +
     `Inserted: ${row.inserted || '?'} | Recorded: ${row.recorded || '?'} | On target: ${row.on_target || '?'}\n` +
-    `Head correction: ${row.head_angle_deg} degrees (added to Arc AP) | Depth: ${row.depth_mm || 'unavailable'} mm`;
+    `AP convention: ${convention} | Tilt: ${tiltRule} degrees | Depth: ${row.depth_mm || 'unavailable'} mm`;
   controls.details.style.whiteSpace = 'pre-line';
   controls.warnings.textContent = [row.error, row.warnings].filter(Boolean).join('\n');
   controls.transforms.textContent = JSON.stringify({

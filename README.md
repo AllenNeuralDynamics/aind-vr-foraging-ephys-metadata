@@ -25,7 +25,12 @@ The converter reads the `Targets` sheet from the configured Excel workbook and w
 uv run python code/insertion_tracking.py "C:\path\to\tracking.xlsx" --output data/insertion_transforms.csv --head-angle 14
 ```
 
-Then serve the viewer from the repository root in a separate terminal:
+For sheets where `Arc AP` is positive anterior, add `--anterior-positive`. This
+uses `-(Arc AP - head angle)` for the probe tilt. Without the flag, the converter
+keeps the legacy `Arc AP + head angle` convention. The selected convention is
+recorded in the output CSV.
+
+Then serve the viewer from the repository root:
 
 ```powershell
 uv run python -m http.server 8000 --bind 127.0.0.1
@@ -38,6 +43,8 @@ Rows are retained even when they cannot produce a trajectory. The `status` colum
 ## Metadata Generation
 
 Use the repository's `.venv` as the Jupyter kernel and run the cells in the [metadata generation notebook](./notebooks/metadata%20generation%20v4.ipynb) in order. Set `insertion_numbers` in the paths/setup cell to the setup numbers to generate. The notebook uses all three paths in `project_config.ini` and requires the corresponding OpenEphys session folders, including:
+
+If the sheet's `Arc AP` values are positive anterior, set `anterior_positive_arc_ap = True` in that setup cell. It defaults to `False` to preserve the legacy `Arc AP + 14` correction.
 
 - `ecephys/Record Node 101/settings.xml`
 - `continuous/Neuropix-PXI-116.*/timestamps.npy`

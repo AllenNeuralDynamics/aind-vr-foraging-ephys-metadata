@@ -46,12 +46,22 @@ def test_notebook_transforms_with_swapped_manipulator_yz(row):
         assert (Rotation if isinstance(transform, Rotation) else Translation).model_validate(dumped) == transform
 
 
+def test_surface_translation_precedes_probe_spin(row):
+    transforms, _, _ = notebook_transforms(row, 14)
+    assert [type(transform) for transform in transforms] == [
+        Rotation, Rotation, Rotation, Translation, Rotation, Translation,
+    ]
+    steps = compute_steps(transforms)
+    assert steps[4]["label"] == "4. Move to surface (local XYZ, using Surface Z)"
+    assert steps[5]["label"] == "5. Spin (local Y)"
+
+
 def test_default_orientation_and_surface_to_tip(row):
     transforms, _, _ = notebook_transforms(row, 14)
     steps = compute_steps(transforms)
     for actual, expected in zip(steps[1]["basis"], [[0, -1, 0], [0, 0, 1], [-1, 0, 0]]):
         assert actual == pytest.approx(expected)
-    assert steps[5]["position"] == pytest.approx([-2, -1, -3])
+    assert steps[4]["position"] == pytest.approx([-2, -1, -3])
     assert steps[6]["position"] == pytest.approx([-2, -1, -4])
 
 
@@ -70,7 +80,7 @@ def test_manipulator_axes_map_to_probe_positive_x_positive_z_negative_y(row, axi
     expected_manipulator = [0, 0, 0]
     expected_manipulator["XYZ".index(axis)] = offset
     assert result["manipulator_offset_mm"] == expected_manipulator
-    surface = result["transforms"][4]["translation"]
+    surface = result["transforms"][3]["translation"]
     depth = result["transforms"][5]["translation"]
     expected_probe = [expected_manipulator[0], -expected_manipulator[2], expected_manipulator[1]]
     assert [surface[i] + depth[i] for i in range(3)] == expected_probe
@@ -88,11 +98,21 @@ def test_head_angle_is_added(row, arc_ap, head_angle, expected_tilt):
     assert rotation.angles == [expected_tilt, 0, 0]
     result = convert_row(row, head_angle)
     assert result["head_angle_deg"] == head_angle
+    assert result["arc_ap_convention"] == "posterior_positive"
     assert result["transforms"][1]["angles"] == [expected_tilt, 0, 0]
     axis = result["steps"][2]["basis"][1]
     angle = math.radians(expected_tilt)
     assert axis == pytest.approx([0, -math.sin(angle), math.cos(angle)])
-    assert "Arc AP + head angle" in result["steps"][2]["label"]
+    assert "Arc AP head-angle correction" in result["steps"][2]["label"]
+
+
+def test_anterior_positive_arc_ap_uses_negative_corrected_tilt(row):
+    row["Arc AP"] = "20"
+    transforms, _, _ = notebook_transforms(row, 14, anterior_positive=True)
+    result = convert_row(row, 14, anterior_positive=True)
+    assert transforms[1].angles == [-6, 0, 0]
+    assert result["arc_ap_convention"] == "anterior_positive"
+    assert result["transforms"][1]["angles"] == [-6, 0, 0]
 
 
 def test_head_correction_and_nonzero_local_angles(row):
@@ -104,7 +124,7 @@ def test_head_correction_and_nonzero_local_angles(row):
     a, b = math.radians(14), math.radians(30)
     expected_axis = [-math.sin(b), -math.sin(a) * math.cos(b), math.cos(a) * math.cos(b)]
     assert steps[3]["basis"][1] == pytest.approx(expected_axis)
-    assert steps[4]["basis"][1] == pytest.approx(expected_axis)
+    assert steps[5]["basis"][1] == pytest.approx(expected_axis)
     displacement = [steps[6]["position"][i] - steps[5]["position"][i] for i in range(3)]
     assert displacement == pytest.approx([-v for v in expected_axis])
     for step in steps:
@@ -127,14 +147,14 @@ def test_notebook_spin_also_moves_tip_and_surface_depth_cancels(row):
 def test_surface_and_depth_are_separate_translations(row):
     original = convert_row(row, 14)
     changed_surface = convert_row(dict(row, **{"Surface Z": "2000", "Insertion Z": "2000"}), 14)
-    assert original["transforms"][4]["translation"] == [1, -3, 2]
-    assert changed_surface["transforms"][4]["translation"] == [1, -2, 2]
+    assert original["transforms"][3]["translation"] == [1, -3, 2]
+    assert changed_surface["transforms"][3]["translation"] == [1, -2, 2]
     assert original["transforms"][5]["translation"] == [0, -1, 0]
     assert changed_surface["transforms"][5]["translation"] == [0, -2, 0]
-    assert changed_surface["steps"][5]["position"] != pytest.approx(original["steps"][5]["position"])
+    assert changed_surface["steps"][4]["position"] != pytest.approx(original["steps"][4]["position"])
     assert changed_surface["steps"][6]["position"] == pytest.approx(original["steps"][6]["position"])
     changed_final = convert_row(dict(row, **{"Final Z": "5000", "Insertion Z": "2000"}), 14)
-    assert changed_final["transforms"][4] == original["transforms"][4]
+    assert changed_final["transforms"][3] == original["transforms"][3]
     assert changed_final["transforms"][5]["translation"] == [0, -2, 0]
 
 
@@ -181,6 +201,15 @@ def test_csv_round_trip_padding_bom_and_duplicate_headers(row, tmp_path):
     assert original["Manip controller SN"] == "111"
     assert original["Manip controller SN [2]"] == "222"
     assert json.loads(parsed["transforms"]) == results[0]["transforms"]
+    assert parsed["arc_ap_convention"] == "posterior_positive"
+
+    anterior_output = tmp_path / "anterior.csv"
+    anterior_results = convert_file(source, anterior_output, anterior_positive=True)
+    with anterior_output.open(newline="") as stream:
+        anterior_parsed = next(csv.DictReader(stream))
+    assert anterior_parsed["arc_ap_convention"] == "anterior_positive"
+    assert json.loads(anterior_parsed["transforms"])[1]["angles"] == [28.0, 0.0, 0.0]
+    assert anterior_results[0]["arc_ap_convention"] == "anterior_positive"
     assert json.loads(parsed["steps"]) == results[0]["steps"]
     assert parsed["target_id"] == "362"
 
